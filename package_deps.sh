@@ -35,8 +35,8 @@ tar -czf "$SCRIPT_DIR/${BUNDLE_NAME}.tar.gz" \
     -C "$SCRIPT_DIR" \
     package/ \
     install.sh \
-    send3bits.py
-    # rec3bits.py - not needed on the target, but we can include it for reference
+    sender.py
+    # receiver.py - not needed on the target, but we can include it for reference
 
 echo ""
 echo "=== Done ==="
