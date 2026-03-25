@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 # Compiles sender.c and generates a base64-encoded text file of the binary.
 # Usage: ./build_sender.sh
 

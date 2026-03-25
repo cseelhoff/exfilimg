@@ -15,15 +15,16 @@
  *   gcc -O2 -o sender sender.c -lX11
  *
  * Usage:
- *   ./sender [watch_dir]          # default: ./drop
+ *   ./sender [-b bpp] [watch_dir] # default: 3 bpp, ./drop
  *
- * Frame header (17 bytes):
+ * Frame header (18 bytes):
  *   [0..3]   CCSDS sync: 0x1A 0xCF 0xFC 0x1D
  *   [4..5]   pixels_per_row (LE) — auto-detected
- *   [6..7]   total_chunks (LE)
- *   [8..9]   chunk_index (LE)
- *   [10..12] payload_length (LE, 3 bytes)
- *   [13..16] CRC32 of payload (LE)
+ *   [6]      bits_per_pixel (3,6,9,...,24)
+ *   [7..8]   total_chunks (LE)
+ *   [9..10]  chunk_index (LE)
+ *   [11..13] payload_length (LE, 3 bytes)
+ *   [14..17] CRC32 of payload (LE)
  *
  * Back channel: any keypress in X11 window = ACK (advance to next frame).
  */
@@ -43,11 +44,12 @@
 #include <X11/keysym.h>
 
 #define BORDER       5
-#define HEADER_SIZE  17   /* 4 sync + 2 ppr + 2 total + 2 idx + 3 len + 4 crc32 */
+#define HEADER_SIZE  18   /* 4 sync + 2 ppr + 1 bpp + 2 total + 2 idx + 3 len + 4 crc32 */
 #define INIT_W       800  /* initial window width; user can resize/maximize */
 #define INIT_H       600  /* initial window height */
 
 static const uint8_t SYNC[4] = { 0x1A, 0xCF, 0xFC, 0x1D };
+static int      bpp = 3;  /* bits per pixel: 3,6,9,...,24 */
 
 static Display *dpy;
 static Window   win;
@@ -112,9 +114,9 @@ static void update_geometry(void)
     max_rows = win_h - 2 * BORDER;
     if (ppr < 1) ppr = 1;
     if (max_rows < 1) max_rows = 1;
-    max_payload = (size_t)((ppr * 3) / 8 * max_rows) - HEADER_SIZE;
-    printf("Window: %dx%d, usable: %d×%d px, payload: %zu bytes/frame\n",
-           win_w, win_h, ppr, max_rows, max_payload);
+    max_payload = (size_t)ppr * (size_t)max_rows * (size_t)bpp / 8 - HEADER_SIZE;
+    printf("Window: %dx%d, usable: %d×%d px, %d bpp, payload: %zu bytes/frame\n",
+           win_w, win_h, ppr, max_rows, bpp, max_payload);
 }
 
 static void x11_init(void)
@@ -147,45 +149,64 @@ static void x11_init(void)
 static void show_frame(const uint8_t *payload, size_t payload_len,
                        int chunk_idx, int total_chunks)
 {
+    int bpc = bpp / 3;
+    int levels = 1 << bpc;
+
     uint32_t crc = crc32_compute(payload, payload_len);
     uint8_t hdr[HEADER_SIZE];
     memcpy(hdr, SYNC, 4);
     hdr[4]  = ppr & 0xFF;
     hdr[5]  = (ppr >> 8) & 0xFF;
-    hdr[6]  = total_chunks & 0xFF;
-    hdr[7]  = (total_chunks >> 8) & 0xFF;
-    hdr[8]  = chunk_idx & 0xFF;
-    hdr[9]  = (chunk_idx >> 8) & 0xFF;
-    hdr[10] = payload_len & 0xFF;
-    hdr[11] = (payload_len >> 8) & 0xFF;
-    hdr[12] = (payload_len >> 16) & 0xFF;
-    hdr[13] = crc & 0xFF;
-    hdr[14] = (crc >> 8) & 0xFF;
-    hdr[15] = (crc >> 16) & 0xFF;
-    hdr[16] = (crc >> 24) & 0xFF;
+    hdr[6]  = (uint8_t)bpp;
+    hdr[7]  = total_chunks & 0xFF;
+    hdr[8]  = (total_chunks >> 8) & 0xFF;
+    hdr[9]  = chunk_idx & 0xFF;
+    hdr[10] = (chunk_idx >> 8) & 0xFF;
+    hdr[11] = payload_len & 0xFF;
+    hdr[12] = (payload_len >> 8) & 0xFF;
+    hdr[13] = (payload_len >> 16) & 0xFF;
+    hdr[14] = crc & 0xFF;
+    hdr[15] = (crc >> 8) & 0xFF;
+    hdr[16] = (crc >> 16) & 0xFF;
+    hdr[17] = (crc >> 24) & 0xFF;
 
+    /* Build combined data buffer */
     size_t packed_len = HEADER_SIZE + payload_len;
+    uint8_t *packed = malloc(packed_len);
+    if (!packed) return;
+    memcpy(packed, hdr, HEADER_SIZE);
+    memcpy(packed + HEADER_SIZE, payload, payload_len);
 
     uint32_t *pixels = calloc((size_t)win_w * win_h, sizeof(uint32_t));
-    if (!pixels) return;
+    if (!pixels) { free(packed); return; }
 
-    size_t bit_idx = 0;
-    for (size_t i = 0; i < packed_len; i++) {
-        uint8_t byte = (i < HEADER_SIZE) ? hdr[i] : payload[i - HEADER_SIZE];
-        for (int b = 7; b >= 0; b--) {
-            if ((byte >> b) & 1) {
-                int chan = (int)(bit_idx % 3);
-                int px   = (int)((bit_idx / 3) % (size_t)ppr);
-                int py   = (int)((bit_idx / 3) / (size_t)ppr);
-                int dx   = BORDER + px, dy = BORDER + py;
-                if (dy < win_h) {
-                    uint32_t shift = (chan == 0) ? 0 : (chan == 1) ? 8 : 16;
-                    pixels[dy * win_w + dx] |= 0xFFu << shift;
+    size_t total_bits = packed_len * 8;
+
+    for (size_t pi = 0; pi * (size_t)bpp < total_bits; pi++) {
+        int px = (int)(pi % (size_t)ppr);
+        int py = (int)(pi / (size_t)ppr);
+        int dx = BORDER + px, dy = BORDER + py;
+        if (dy >= win_h) break;
+
+        uint32_t pixel = 0;
+        for (int c = 0; c < 3; c++) {
+            unsigned val = 0;
+            for (int bi = 0; bi < bpc; bi++) {
+                size_t pos = pi * (size_t)bpp + (size_t)c * (size_t)bpc + (size_t)bi;
+                if (pos < total_bits) {
+                    size_t byte_idx = pos / 8;
+                    int bit_in_byte = 7 - (int)(pos % 8);
+                    if ((packed[byte_idx] >> bit_in_byte) & 1)
+                        val |= 1u << (bpc - 1 - bi);
                 }
             }
-            bit_idx++;
+            uint8_t chan_val = (uint8_t)(val * 255 / (levels - 1));
+            pixel |= (uint32_t)chan_val << (c * 8);
         }
+        pixels[dy * win_w + dx] = pixel;
     }
+
+    free(packed);
 
     XImage *img = XCreateImage(dpy, vis, (unsigned)depth, ZPixmap, 0,
                                (char *)pixels, (unsigned)win_w, (unsigned)win_h, 32, 0);
@@ -244,19 +265,13 @@ static void drain_keys(void)
 
 /* ── compress + split a file ─────────────────────────────────────────── */
 
-static char *compress_and_split(const char *filepath, int *out_count)
+/* Chunks are written into the watch dir with a dot prefix (.chunk.aa, .chunk.ab,
+   …) so find_next_file() naturally skips them (it ignores dotfiles). Returns 1
+   on success; caller deletes chunk files after sending. */
+
+static int compress_and_split(const char *filepath, const char *watchdir,
+                              int *out_count)
 {
-    /* Create temp dir for chunks */
-    char tmpdir[] = "/tmp/s3b_XXXXXX";
-    if (!mkdtemp(tmpdir)) { perror("mkdtemp"); return NULL; }
-
-    /* tar czf - <file> | split -b <max_payload> - <tmpdir>/chunk. */
-    char cmd[2048];
-    snprintf(cmd, sizeof(cmd),
-             "tar czf - -C '%s' '%s' | split -b %zu - '%s/chunk.'",
-             /* dirname */ "", filepath, max_payload, tmpdir);
-
-    /* We need dirname/basename separately. Find last slash. */
     const char *base = strrchr(filepath, '/');
     const char *dir;
     char dirbuf[1024];
@@ -272,30 +287,29 @@ static char *compress_and_split(const char *filepath, int *out_count)
         base = filepath;
     }
 
+    char cmd[2048];
     snprintf(cmd, sizeof(cmd),
-             "tar czf - -C '%s' '%s' | split -b %zu - '%s/chunk.'",
-             dir, base, max_payload, tmpdir);
+             "tar czf - -C '%s' '%s' | split -b %zu - '%s/.chunk.'",
+             dir, base, max_payload, watchdir);
 
     int rc = system(cmd);
     if (rc != 0) {
         fprintf(stderr, "compress/split failed (exit %d)\n", rc);
-        return NULL;
+        return 0;
     }
 
     /* Count chunk files */
-    DIR *d = opendir(tmpdir);
-    if (!d) { perror(tmpdir); return NULL; }
+    DIR *d = opendir(watchdir);
+    if (!d) { perror(watchdir); return 0; }
     int count = 0;
     struct dirent *ent;
     while ((ent = readdir(d)) != NULL) {
-        if (strncmp(ent->d_name, "chunk.", 6) == 0) count++;
+        if (strncmp(ent->d_name, ".chunk.", 7) == 0) count++;
     }
     closedir(d);
 
     *out_count = count;
-    char *result = malloc(strlen(tmpdir) + 1);
-    strcpy(result, tmpdir);
-    return result;
+    return 1;
 }
 
 /* ── scan drop directory for files ───────────────────────────────────── */
@@ -325,7 +339,19 @@ static char *find_next_file(const char *watchdir)
 
 int main(int argc, char **argv)
 {
-    const char *watchdir = (argc > 1) ? argv[1] : "./drop";
+    const char *watchdir = "./drop";
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) {
+            bpp = atoi(argv[++i]);
+            if (bpp < 3 || bpp > 24 || bpp % 3 != 0) {
+                fprintf(stderr, "Invalid -b: %d (must be 3,6,9,12,15,18,21,24)\n", bpp);
+                return 1;
+            }
+        } else {
+            watchdir = argv[i];
+        }
+    }
 
     /* Ensure watch directory exists */
     mkdir(watchdir, 0755);
@@ -354,10 +380,9 @@ int main(int argc, char **argv)
         update_geometry();
 
         int nchunks = 0;
-        char *tmpdir = compress_and_split(filepath, &nchunks);
-        if (!tmpdir || nchunks == 0) {
+        if (!compress_and_split(filepath, watchdir, &nchunks) || nchunks == 0) {
             fprintf(stderr, "  Failed to process, skipping.\n");
-            free(filepath); free(tmpdir);
+            free(filepath);
             continue;
         }
 
@@ -366,10 +391,10 @@ int main(int argc, char **argv)
         /* Sort and send each chunk */
         int success = 1;
         for (int ci = 0; ci < nchunks && !quit; ci++) {
-            /* Chunk filenames: chunk.aa, chunk.ab, ... */
+            /* Chunk filenames: .chunk.aa, .chunk.ab, ... */
             char chunkpath[1024];
             char suffix[3] = { (char)('a' + ci / 26), (char)('a' + ci % 26), '\0' };
-            snprintf(chunkpath, sizeof(chunkpath), "%s/chunk.%s", tmpdir, suffix);
+            snprintf(chunkpath, sizeof(chunkpath), "%s/.chunk.%s", watchdir, suffix);
 
             size_t clen = 0;
             uint8_t *cdata = load_file(chunkpath, &clen);
@@ -387,11 +412,13 @@ int main(int argc, char **argv)
             printf("  ACK received.\n");
         }
 
-        /* Clean up temp chunks */
-        char rmcmd[1024];
-        snprintf(rmcmd, sizeof(rmcmd), "rm -rf '%s'", tmpdir);
-        system(rmcmd);
-        free(tmpdir);
+        /* Clean up chunk files */
+        for (int ci = 0; ci < nchunks; ci++) {
+            char chunkpath[1024];
+            char suffix[3] = { (char)('a' + ci / 26), (char)('a' + ci % 26), '\0' };
+            snprintf(chunkpath, sizeof(chunkpath), "%s/.chunk.%s", watchdir, suffix);
+            unlink(chunkpath);
+        }
 
         if (success && !quit) {
             unlink(filepath);
