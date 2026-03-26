@@ -64,6 +64,7 @@ Maximize the window for maximum payload per frame.
 pip install numpy mss
 python3 receiver.py
 python3 receiver.py --monitor 2 --outdir received  # options
+python3 receiver.py --scan-limit 512                # limit scan range per row (bytes, 0 = unlimited)
 ```
 
 ### 5. Transfer a file

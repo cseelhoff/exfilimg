@@ -43,36 +43,47 @@
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
 
-#define BORDER       5
-#define HEADER_SIZE  18   /* 4 sync + 2 ppr + 1 bpp + 2 total + 2 idx + 3 len + 4 crc32 */
-#define INIT_W       800  /* initial window width; user can resize/maximize */
-#define INIT_H       600  /* initial window height */
+#define BORDER            5     /* pixel border around encoded content */
+#define HEADER_SIZE       18    /* 4 sync + 2 ppr + 1 bpp + 2 total + 2 idx + 3 len + 4 crc */
+#define HDR_PIXEL_COUNT   (HEADER_SIZE * 8 / 3) /* 48 pixels: header always encoded at 3 bpp */
+#define INIT_WIDTH        800   /* initial window width; user can resize/maximize */
+#define INIT_HEIGHT       600   /* initial window height */
 
-static const uint8_t SYNC[4] = { 0x1A, 0xCF, 0xFC, 0x1D };
-static int      bpp = 3;  /* bits per pixel: 3,6,9,...,24 */
+/* CCSDS sync marker — a standard frame synchronization pattern from satellite
+   communications, chosen for its optimal autocorrelation properties (minimizes
+   false-positive sync detection when scanning a noisy pixel stream). */
+static const uint8_t SYNC_MARKER[4] = { 0x1A, 0xCF, 0xFC, 0x1D };
 
-static Display *dpy;
-static Window   win;
-static Visual  *vis;
-static GC       gc;
-static int      scr, depth;
-static Atom     wm_delete;
-static int      ppr;       /* pixels per row, auto-detected */
-static int      max_rows;
-static int      win_w, win_h;
-static size_t   max_payload;
+/* Bits per pixel: each pixel encodes this many bits across its 3 RGB channels.
+   Must be a multiple of 3 (valid: 3, 6, 9, ... 24). Higher = more data per
+   frame but requires more accurate color reproduction by the display. */
+static int bits_per_pixel = 3;
+
+/* X11 display resources */
+static Display *display;
+static Window   window;
+static Visual  *visual;
+static GC       graphics_ctx;
+static int      screen_num, color_depth;
+static Atom     wm_delete_atom;       /* WM_DELETE_WINDOW protocol atom */
+
+/* Frame geometry (recomputed on window resize) */
+static int      pixels_per_row;       /* usable pixel columns (width minus borders) */
+static int      max_rows;             /* usable pixel rows (height minus borders) */
+static int      win_width, win_height;
+static size_t   max_payload;          /* max payload bytes that fit in one frame */
 
 static volatile sig_atomic_t quit = 0;
-static void on_signal(int s) { (void)s; quit = 1; }
+static void on_signal(int sig) { (void)sig; quit = 1; }
 
 /* ── CRC32 (same polynomial as zlib) ─────────────────────────────────── */
 
-static uint32_t crc32_compute(const uint8_t *buf, size_t len)
+static uint32_t crc32_compute(const uint8_t *data, size_t length)
 {
     uint32_t crc = 0xFFFFFFFF;
-    for (size_t i = 0; i < len; i++) {
-        crc ^= buf[i];
-        for (int b = 0; b < 8; b++)
+    for (size_t i = 0; i < length; i++) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; bit++)
             crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
     }
     return ~crc;
@@ -80,233 +91,281 @@ static uint32_t crc32_compute(const uint8_t *buf, size_t len)
 
 /* ── helpers ─────────────────────────────────────────────────────────── */
 
-static void msleep(int ms)
+static void msleep(int milliseconds)
 {
-    struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
+    struct timespec ts = { milliseconds / 1000, (milliseconds % 1000) * 1000000L };
     nanosleep(&ts, NULL);
 }
 
-static uint8_t *load_file(const char *path, size_t *len)
+/* Read an entire file into a malloc'd buffer. Caller must free(). */
+static uint8_t *load_file(const char *path, size_t *out_len)
 {
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long n = ftell(f);
-    if (n <= 0) { fclose(f); return NULL; }
-    rewind(f);
-    uint8_t *buf = malloc((size_t)n);
-    if (!buf || (long)fread(buf, 1, (size_t)n, f) != n) { free(buf); fclose(f); return NULL; }
-    fclose(f);
-    *len = (size_t)n;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return NULL;
+    fseek(fp, 0, SEEK_END);
+    long file_size = ftell(fp);
+    if (file_size <= 0) { fclose(fp); return NULL; }
+    rewind(fp);
+    uint8_t *buf = malloc((size_t)file_size);
+    if (!buf || (long)fread(buf, 1, (size_t)file_size, fp) != file_size) {
+        free(buf); fclose(fp); return NULL;
+    }
+    fclose(fp);
+    *out_len = (size_t)file_size;
     return buf;
 }
 
+/* Little-endian serialization helpers */
+static void put_le16(uint8_t *dst, uint16_t v) { dst[0] = v; dst[1] = v >> 8; }
+static void put_le24(uint8_t *dst, uint32_t v) { dst[0] = v; dst[1] = v >> 8; dst[2] = v >> 16; }
+static void put_le32(uint8_t *dst, uint32_t v) { dst[0] = v; dst[1] = v >> 8; dst[2] = v >> 16; dst[3] = v >> 24; }
+
 /* ── X11 setup ───────────────────────────────────────────────────────── */
 
-/* Recompute geometry from current window dimensions */
+/* Recompute frame geometry from current window dimensions.
+   The usable pixel area is the window minus BORDER pixels on each side.
+   max_payload determines how many data bytes fit in one frame at current bpp. */
 static void update_geometry(void)
 {
-    XWindowAttributes wa;
-    XGetWindowAttributes(dpy, win, &wa);
-    win_w = wa.width;
-    win_h = wa.height;
-    ppr = win_w - 2 * BORDER;
-    max_rows = win_h - 2 * BORDER;
-    if (ppr < 1) ppr = 1;
+    XWindowAttributes win_attrs;
+    XGetWindowAttributes(display, window, &win_attrs);
+    win_width  = win_attrs.width;
+    win_height = win_attrs.height;
+
+    /* Usable pixel grid = window area minus borders on each side */
+    pixels_per_row = win_width  - 2 * BORDER;
+    max_rows       = win_height - 2 * BORDER;
+    if (pixels_per_row < 1) pixels_per_row = 1;
     if (max_rows < 1) max_rows = 1;
-    max_payload = (size_t)ppr * (size_t)max_rows * (size_t)bpp / 8 - HEADER_SIZE;
-    printf("Window: %dx%d, usable: %d×%d px, %d bpp, payload: %zu bytes/frame\n",
-           win_w, win_h, ppr, max_rows, bpp, max_payload);
+
+    /* Total usable pixels, minus fixed-size header pixels, converted to bytes */
+    max_payload = ((size_t)pixels_per_row * (size_t)max_rows - HDR_PIXEL_COUNT)
+                  * (size_t)bits_per_pixel / 8;
+    printf("Window: %dx%d, usable: %d\xc3\x97%d px, %d bpp, payload: %zu bytes/frame\n",
+           win_width, win_height, pixels_per_row, max_rows, bits_per_pixel, max_payload);
 }
 
 static void x11_init(void)
 {
-    dpy = XOpenDisplay(NULL);
-    if (!dpy) { fprintf(stderr, "Cannot open X display\n"); exit(1); }
+    display = XOpenDisplay(NULL);
+    if (!display) { fprintf(stderr, "Cannot open X display\n"); exit(1); }
 
-    scr   = DefaultScreen(dpy);
-    vis   = DefaultVisual(dpy, scr);
-    depth = DefaultDepth(dpy, scr);
-    gc    = DefaultGC(dpy, scr);
+    screen_num   = DefaultScreen(display);
+    visual       = DefaultVisual(display, screen_num);
+    color_depth  = DefaultDepth(display, screen_num);
+    graphics_ctx = DefaultGC(display, screen_num);
 
-    win = XCreateSimpleWindow(dpy, RootWindow(dpy, scr),
-                              0, 0, INIT_W, INIT_H, 0, 0, 0);
-    XStoreName(dpy, win, "sender");
-    wm_delete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
-    XSetWMProtocols(dpy, win, &wm_delete, 1);
-    XSelectInput(dpy, win, ExposureMask | KeyPressMask | StructureNotifyMask);
-    XMapWindow(dpy, win);
+    window = XCreateSimpleWindow(display, RootWindow(display, screen_num),
+                                 0, 0, INIT_WIDTH, INIT_HEIGHT, 0, 0, 0);
+    XStoreName(display, window, "sender");
 
-    /* Wait for map */
-    XEvent ev;
-    while (1) { XNextEvent(dpy, &ev); if (ev.type == Expose) break; }
+    /* Register for WM_DELETE_WINDOW so we handle window close gracefully */
+    wm_delete_atom = XInternAtom(display, "WM_DELETE_WINDOW", False);
+    XSetWMProtocols(display, window, &wm_delete_atom, 1);
+    XSelectInput(display, window, ExposureMask | KeyPressMask | StructureNotifyMask);
+    XMapWindow(display, window);
+
+    /* Block until the window is mapped and the first Expose event arrives */
+    XEvent event;
+    while (1) { XNextEvent(display, &event); if (event.type == Expose) break; }
 
     update_geometry();
 }
 
 /* ── frame encoding & display ────────────────────────────────────────── */
 
+/* Encode a single chunk as a pixel frame and display it in the X11 window.
+   The frame has two regions:
+   1. Header (always 3 bpp / 1 bit per channel) — carries sync marker,
+      geometry, chunk metadata, payload length, and CRC32.
+   2. Payload (at the configured bits_per_pixel) — the actual data bytes.
+   The header is always at 3 bpp so the receiver can locate and parse it
+   without knowing the payload's bpp setting in advance. */
 static void show_frame(const uint8_t *payload, size_t payload_len,
                        int chunk_idx, int total_chunks)
 {
-    int bpc = bpp / 3;
-    int levels = 1 << bpc;
+    int bits_per_chan = bits_per_pixel / 3;     /* bits encoded per color channel */
+    int quantize_levels = 1 << bits_per_chan;   /* distinct values per channel */
 
-    uint32_t crc = crc32_compute(payload, payload_len);
-    uint8_t hdr[HEADER_SIZE];
-    memcpy(hdr, SYNC, 4);
-    hdr[4]  = ppr & 0xFF;
-    hdr[5]  = (ppr >> 8) & 0xFF;
-    hdr[6]  = (uint8_t)bpp;
-    hdr[7]  = total_chunks & 0xFF;
-    hdr[8]  = (total_chunks >> 8) & 0xFF;
-    hdr[9]  = chunk_idx & 0xFF;
-    hdr[10] = (chunk_idx >> 8) & 0xFF;
-    hdr[11] = payload_len & 0xFF;
-    hdr[12] = (payload_len >> 8) & 0xFF;
-    hdr[13] = (payload_len >> 16) & 0xFF;
-    hdr[14] = crc & 0xFF;
-    hdr[15] = (crc >> 8) & 0xFF;
-    hdr[16] = (crc >> 16) & 0xFF;
-    hdr[17] = (crc >> 24) & 0xFF;
+    /* ── Build the 18-byte frame header ── */
+    uint32_t payload_crc = crc32_compute(payload, payload_len);
+    uint8_t header[HEADER_SIZE];
+    memcpy(header, SYNC_MARKER, 4);                         /* [0..3]   sync pattern */
+    put_le16(header + 4,  (uint16_t)pixels_per_row);        /* [4..5]   pixels per row */
+    header[6] = (uint8_t)bits_per_pixel;                    /* [6]      bits per pixel */
+    put_le16(header + 7,  (uint16_t)total_chunks);          /* [7..8]   total chunks */
+    put_le16(header + 9,  (uint16_t)chunk_idx);             /* [9..10]  chunk index */
+    put_le24(header + 11, (uint32_t)payload_len);           /* [11..13] payload length */
+    put_le32(header + 14, payload_crc);                     /* [14..17] CRC32 */
 
-    /* Build combined data buffer */
-    size_t packed_len = HEADER_SIZE + payload_len;
-    uint8_t *packed = malloc(packed_len);
-    if (!packed) return;
-    memcpy(packed, hdr, HEADER_SIZE);
-    memcpy(packed + HEADER_SIZE, payload, payload_len);
+    /* Allocate a full-window pixel buffer (zero-initialized = black background) */
+    uint32_t *framebuf = calloc((size_t)win_width * win_height, sizeof(uint32_t));
+    if (!framebuf) return;
 
-    uint32_t *pixels = calloc((size_t)win_w * win_h, sizeof(uint32_t));
-    if (!pixels) { free(packed); return; }
-
-    size_t total_bits = packed_len * 8;
-
-    for (size_t pi = 0; pi * (size_t)bpp < total_bits; pi++) {
-        int px = (int)(pi % (size_t)ppr);
-        int py = (int)(pi / (size_t)ppr);
-        int dx = BORDER + px, dy = BORDER + py;
-        if (dy >= win_h) break;
+    /* ── Pass 1: Encode header pixels at fixed 3 bpp (1 bit per channel) ── */
+    size_t header_bit_count = HEADER_SIZE * 8;
+    for (size_t pixel_idx = 0; pixel_idx < HDR_PIXEL_COUNT; pixel_idx++) {
+        int col = (int)(pixel_idx % (size_t)pixels_per_row);
+        int row = (int)(pixel_idx / (size_t)pixels_per_row);
+        int draw_x = BORDER + col, draw_y = BORDER + row;
+        if (draw_y >= win_height) break;
 
         uint32_t pixel = 0;
-        for (int c = 0; c < 3; c++) {
-            unsigned val = 0;
-            for (int bi = 0; bi < bpc; bi++) {
-                size_t pos = pi * (size_t)bpp + (size_t)c * (size_t)bpc + (size_t)bi;
-                if (pos < total_bits) {
-                    size_t byte_idx = pos / 8;
-                    int bit_in_byte = 7 - (int)(pos % 8);
-                    if ((packed[byte_idx] >> bit_in_byte) & 1)
-                        val |= 1u << (bpc - 1 - bi);
-                }
+        for (int chan = 0; chan < 3; chan++) {
+            size_t bit_pos = pixel_idx * 3 + (size_t)chan;
+            unsigned bit_val = 0;
+            if (bit_pos < header_bit_count) {
+                size_t byte_idx = bit_pos / 8;
+                int bit_in_byte = 7 - (int)(bit_pos % 8);
+                if ((header[byte_idx] >> bit_in_byte) & 1)
+                    bit_val = 1;
             }
-            uint8_t chan_val = (uint8_t)(val * 255 / (levels - 1));
-            pixel |= (uint32_t)chan_val << (c * 8);
+            /* 1 bit per channel: map to either 0 or 255 */
+            pixel |= (uint32_t)(bit_val ? 255 : 0) << (chan * 8);
         }
-        pixels[dy * win_w + dx] = pixel;
+        framebuf[draw_y * win_width + draw_x] = pixel;
     }
 
-    free(packed);
+    /* ── Pass 2: Encode payload pixels at configured bpp ──
+       Each pixel's 3 channels each carry bits_per_chan bits. Channel values
+       are quantized: e.g. at 2 bits/chan, values 0–3 map to 0, 85, 170, 255. */
+    size_t payload_bit_count = payload_len * 8;
+    for (size_t pixel_idx = 0; pixel_idx * (size_t)bits_per_pixel < payload_bit_count; pixel_idx++) {
+        /* Payload pixels start immediately after the header pixels */
+        size_t abs_pixel_idx = HDR_PIXEL_COUNT + pixel_idx;
+        int col = (int)(abs_pixel_idx % (size_t)pixels_per_row);
+        int row = (int)(abs_pixel_idx / (size_t)pixels_per_row);
+        int draw_x = BORDER + col, draw_y = BORDER + row;
+        if (draw_y >= win_height) break;
 
-    XImage *img = XCreateImage(dpy, vis, (unsigned)depth, ZPixmap, 0,
-                               (char *)pixels, (unsigned)win_w, (unsigned)win_h, 32, 0);
-    if (img) {
-        XPutImage(dpy, win, gc, img, 0, 0, 0, 0, (unsigned)win_w, (unsigned)win_h);
-        XFlush(dpy);
-        XDestroyImage(img); /* frees pixels */
+        uint32_t pixel = 0;
+        for (int chan = 0; chan < 3; chan++) {
+            unsigned chan_val = 0;
+            /* Extract bits_per_chan bits for this channel from the payload */
+            for (int bit_idx = 0; bit_idx < bits_per_chan; bit_idx++) {
+                size_t bit_pos = pixel_idx * (size_t)bits_per_pixel
+                               + (size_t)chan * (size_t)bits_per_chan
+                               + (size_t)bit_idx;
+                if (bit_pos < payload_bit_count) {
+                    size_t byte_idx = bit_pos / 8;
+                    int bit_in_byte = 7 - (int)(bit_pos % 8);
+                    if ((payload[byte_idx] >> bit_in_byte) & 1)
+                        chan_val |= 1u << (bits_per_chan - 1 - bit_idx);
+                }
+            }
+            /* Scale quantized value to full 0–255 range */
+            uint8_t color = (uint8_t)(chan_val * 255 / (quantize_levels - 1));
+            pixel |= (uint32_t)color << (chan * 8);
+        }
+        framebuf[draw_y * win_width + draw_x] = pixel;
+    }
+
+    /* ── Blit the pixel buffer to the X11 window ── */
+    XImage *ximage = XCreateImage(display, visual, (unsigned)color_depth, ZPixmap, 0,
+                                  (char *)framebuf, (unsigned)win_width, (unsigned)win_height, 32, 0);
+    if (ximage) {
+        XPutImage(display, window, graphics_ctx, ximage, 0, 0, 0, 0,
+                  (unsigned)win_width, (unsigned)win_height);
+        XFlush(display);
+        XDestroyImage(ximage); /* also frees framebuf */
     } else {
-        free(pixels);
+        free(framebuf);
     }
 }
 
+/* Display an all-black screen to signal idle state (no file being sent). */
 static void show_idle(void)
 {
-    /* Black screen = idle/waiting for files */
-    uint32_t *pixels = calloc((size_t)win_w * win_h, sizeof(uint32_t));
-    if (!pixels) return;
-    XImage *img = XCreateImage(dpy, vis, (unsigned)depth, ZPixmap, 0,
-                               (char *)pixels, (unsigned)win_w, (unsigned)win_h, 32, 0);
-    if (img) {
-        XPutImage(dpy, win, gc, img, 0, 0, 0, 0, (unsigned)win_w, (unsigned)win_h);
-        XFlush(dpy);
-        XDestroyImage(img);
+    uint32_t *framebuf = calloc((size_t)win_width * win_height, sizeof(uint32_t));
+    if (!framebuf) return;
+    XImage *ximage = XCreateImage(display, visual, (unsigned)color_depth, ZPixmap, 0,
+                                  (char *)framebuf, (unsigned)win_width, (unsigned)win_height, 32, 0);
+    if (ximage) {
+        XPutImage(display, window, graphics_ctx, ximage, 0, 0, 0, 0,
+                  (unsigned)win_width, (unsigned)win_height);
+        XFlush(display);
+        XDestroyImage(ximage);
     } else {
-        free(pixels);
+        free(framebuf);
     }
 }
 
 /* ── wait for ACK (any keypress) ─────────────────────────────────────── */
 
+/* Block until the operator presses any key in the X11 window.
+   Returns 1 on keypress (ACK), 0 if the window was closed or quit signaled. */
 static int wait_ack(void)
 {
-    XEvent ev;
+    XEvent event;
     while (!quit) {
-        while (XPending(dpy)) {
-            XNextEvent(dpy, &ev);
-            if (ev.type == KeyPress) return 1;
-            if (ev.type == ClientMessage &&
-                (Atom)ev.xclient.data.l[0] == wm_delete) { quit = 1; return 0; }
+        while (XPending(display)) {
+            XNextEvent(display, &event);
+            if (event.type == KeyPress) return 1;
+            if (event.type == ClientMessage &&
+                (Atom)event.xclient.data.l[0] == wm_delete_atom) { quit = 1; return 0; }
         }
         msleep(10);
     }
     return 0;
 }
 
-/* Drain any pending key events so stale ACKs don't skip frames */
+/* Drain any pending key events so stale keypresses don't skip future frames. */
 static void drain_keys(void)
 {
-    XEvent ev;
-    while (XPending(dpy)) {
-        XNextEvent(dpy, &ev);
-        if (ev.type == ClientMessage &&
-            (Atom)ev.xclient.data.l[0] == wm_delete) quit = 1;
+    XEvent event;
+    while (XPending(display)) {
+        XNextEvent(display, &event);
+        if (event.type == ClientMessage &&
+            (Atom)event.xclient.data.l[0] == wm_delete_atom) quit = 1;
     }
 }
 
 /* ── compress + split a file ─────────────────────────────────────────── */
 
-/* Chunks are written into the watch dir with a dot prefix (.chunk.aa, .chunk.ab,
-   …) so find_next_file() naturally skips them (it ignores dotfiles). Returns 1
-   on success; caller deletes chunk files after sending. */
-
+/* Compress a file with tar+gzip, then split the archive into chunks that
+   each fit in one frame. Chunks are named .chunk.aa, .chunk.ab, … (dot prefix
+   so find_next_file() skips them — it ignores dotfiles).
+   Returns 1 on success; caller is responsible for deleting chunk files. */
 static int compress_and_split(const char *filepath, const char *watchdir,
                               int *out_count)
 {
-    const char *base = strrchr(filepath, '/');
-    const char *dir;
-    char dirbuf[1024];
-    if (base) {
-        size_t dlen = (size_t)(base - filepath);
-        if (dlen == 0) dlen = 1;
-        memcpy(dirbuf, filepath, dlen);
-        dirbuf[dlen] = '\0';
-        dir = dirbuf;
-        base++;
+    /* Separate filepath into directory and basename for tar's -C flag */
+    const char *basename = strrchr(filepath, '/');
+    const char *parent_dir;
+    char parent_buf[1024];
+    if (basename) {
+        size_t dir_len = (size_t)(basename - filepath);
+        if (dir_len == 0) dir_len = 1;  /* handle root paths like "/file" */
+        memcpy(parent_buf, filepath, dir_len);
+        parent_buf[dir_len] = '\0';
+        parent_dir = parent_buf;
+        basename++;  /* skip the '/' */
     } else {
-        dir = ".";
-        base = filepath;
+        parent_dir = ".";
+        basename = filepath;
     }
 
+    /* Pipe: tar compresses to stdout → split chops into max_payload-sized pieces */
     char cmd[2048];
     snprintf(cmd, sizeof(cmd),
              "tar czf - -C '%s' '%s' | split -b %zu - '%s/.chunk.'",
-             dir, base, max_payload, watchdir);
+             parent_dir, basename, max_payload, watchdir);
 
-    int rc = system(cmd);
-    if (rc != 0) {
-        fprintf(stderr, "compress/split failed (exit %d)\n", rc);
+    int exit_code = system(cmd);
+    if (exit_code != 0) {
+        fprintf(stderr, "compress/split failed (exit %d)\n", exit_code);
         return 0;
     }
 
-    /* Count chunk files */
-    DIR *d = opendir(watchdir);
-    if (!d) { perror(watchdir); return 0; }
+    /* Count how many chunk files were produced */
+    DIR *dir_handle = opendir(watchdir);
+    if (!dir_handle) { perror(watchdir); return 0; }
     int count = 0;
-    struct dirent *ent;
-    while ((ent = readdir(d)) != NULL) {
-        if (strncmp(ent->d_name, ".chunk.", 7) == 0) count++;
+    struct dirent *entry;
+    while ((entry = readdir(dir_handle)) != NULL) {
+        if (strncmp(entry->d_name, ".chunk.", 7) == 0) count++;
     }
-    closedir(d);
+    closedir(dir_handle);
 
     *out_count = count;
     return 1;
@@ -314,24 +373,27 @@ static int compress_and_split(const char *filepath, const char *watchdir,
 
 /* ── scan drop directory for files ───────────────────────────────────── */
 
+/* Scan the watch directory for the first non-dotfile regular file.
+   Returns a malloc'd path string, or NULL if nothing is ready. */
 static char *find_next_file(const char *watchdir)
 {
-    DIR *d = opendir(watchdir);
-    if (!d) return NULL;
-    struct dirent *ent;
-    while ((ent = readdir(d)) != NULL) {
-        if (ent->d_name[0] == '.') continue;
+    DIR *dir_handle = opendir(watchdir);
+    if (!dir_handle) return NULL;
+    struct dirent *entry;
+    while ((entry = readdir(dir_handle)) != NULL) {
+        /* Skip dotfiles (includes ".", "..", and our ".chunk.*" temp files) */
+        if (entry->d_name[0] == '.') continue;
         char path[1024];
-        snprintf(path, sizeof(path), "%s/%s", watchdir, ent->d_name);
-        struct stat st;
-        if (stat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
-            closedir(d);
+        snprintf(path, sizeof(path), "%s/%s", watchdir, entry->d_name);
+        struct stat file_stat;
+        if (stat(path, &file_stat) == 0 && S_ISREG(file_stat.st_mode) && file_stat.st_size > 0) {
+            closedir(dir_handle);
             char *result = malloc(strlen(path) + 1);
             strcpy(result, path);
             return result;
         }
     }
-    closedir(d);
+    closedir(dir_handle);
     return NULL;
 }
 
@@ -341,11 +403,13 @@ int main(int argc, char **argv)
 {
     const char *watchdir = "./drop";
 
+    /* Parse command line: [-b bits_per_pixel] [watch_directory] */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) {
-            bpp = atoi(argv[++i]);
-            if (bpp < 3 || bpp > 24 || bpp % 3 != 0) {
-                fprintf(stderr, "Invalid -b: %d (must be 3,6,9,12,15,18,21,24)\n", bpp);
+            bits_per_pixel = atoi(argv[++i]);
+            if (bits_per_pixel < 3 || bits_per_pixel > 24 || bits_per_pixel % 3 != 0) {
+                fprintf(stderr, "Invalid -b: %d (must be 3,6,9,12,15,18,21,24)\n",
+                        bits_per_pixel);
                 return 1;
             }
         } else {
@@ -353,8 +417,7 @@ int main(int argc, char **argv)
         }
     }
 
-    /* Ensure watch directory exists */
-    mkdir(watchdir, 0755);
+    mkdir(watchdir, 0755);  /* ensure watch directory exists */
 
     signal(SIGINT,  on_signal);
     signal(SIGTERM, on_signal);
@@ -366,7 +429,8 @@ int main(int argc, char **argv)
     while (!quit) {
         char *filepath = find_next_file(watchdir);
         if (!filepath) {
-            /* Poll every 500ms */
+            /* No files ready — poll every 500ms (50 × 10ms sleeps),
+               draining stale X events between sleeps. */
             for (int i = 0; i < 50 && !quit; i++) {
                 drain_keys();
                 msleep(10);
@@ -376,48 +440,51 @@ int main(int argc, char **argv)
 
         printf("Found: %s\n", filepath);
 
-        /* Query current window size so split matches actual geometry */
+        /* Re-query window size in case it was resized/maximized since last file */
         update_geometry();
 
-        int nchunks = 0;
-        if (!compress_and_split(filepath, watchdir, &nchunks) || nchunks == 0) {
+        int num_chunks = 0;
+        if (!compress_and_split(filepath, watchdir, &num_chunks) || num_chunks == 0) {
             fprintf(stderr, "  Failed to process, skipping.\n");
             free(filepath);
             continue;
         }
 
-        printf("  %d chunk(s), streaming...\n", nchunks);
+        printf("  %d chunk(s), streaming...\n", num_chunks);
 
-        /* Sort and send each chunk */
+        /* Display each chunk as a frame and wait for operator ACK */
         int success = 1;
-        for (int ci = 0; ci < nchunks && !quit; ci++) {
-            /* Chunk filenames: .chunk.aa, .chunk.ab, ... */
-            char chunkpath[1024];
-            char suffix[3] = { (char)('a' + ci / 26), (char)('a' + ci % 26), '\0' };
-            snprintf(chunkpath, sizeof(chunkpath), "%s/.chunk.%s", watchdir, suffix);
+        for (int chunk_num = 0; chunk_num < num_chunks && !quit; chunk_num++) {
+            /* Chunk filenames use two-letter alphabetic suffixes: aa, ab, … az, ba, … */
+            char chunk_path[1024];
+            char suffix[3] = { (char)('a' + chunk_num / 26),
+                               (char)('a' + chunk_num % 26), '\0' };
+            snprintf(chunk_path, sizeof(chunk_path), "%s/.chunk.%s", watchdir, suffix);
 
-            size_t clen = 0;
-            uint8_t *cdata = load_file(chunkpath, &clen);
-            if (!cdata) {
-                fprintf(stderr, "  Can't read chunk %s\n", chunkpath);
+            size_t chunk_len = 0;
+            uint8_t *chunk_data = load_file(chunk_path, &chunk_len);
+            if (!chunk_data) {
+                fprintf(stderr, "  Can't read chunk %s\n", chunk_path);
                 success = 0; break;
             }
 
-            show_frame(cdata, clen, ci, nchunks);
-            printf("  Frame %d/%d displayed, waiting for ACK...\n", ci + 1, nchunks);
-            free(cdata);
+            show_frame(chunk_data, chunk_len, chunk_num, num_chunks);
+            printf("  Frame %d/%d displayed, waiting for ACK...\n",
+                   chunk_num + 1, num_chunks);
+            free(chunk_data);
 
-            drain_keys();  /* clear stale keys before waiting */
+            drain_keys();  /* clear stale keypresses before waiting */
             if (!wait_ack()) { success = 0; break; }
             printf("  ACK received.\n");
         }
 
-        /* Clean up chunk files */
-        for (int ci = 0; ci < nchunks; ci++) {
-            char chunkpath[1024];
-            char suffix[3] = { (char)('a' + ci / 26), (char)('a' + ci % 26), '\0' };
-            snprintf(chunkpath, sizeof(chunkpath), "%s/.chunk.%s", watchdir, suffix);
-            unlink(chunkpath);
+        /* Remove temporary chunk files regardless of success */
+        for (int chunk_num = 0; chunk_num < num_chunks; chunk_num++) {
+            char chunk_path[1024];
+            char suffix[3] = { (char)('a' + chunk_num / 26),
+                               (char)('a' + chunk_num % 26), '\0' };
+            snprintf(chunk_path, sizeof(chunk_path), "%s/.chunk.%s", watchdir, suffix);
+            unlink(chunk_path);
         }
 
         if (success && !quit) {
@@ -430,7 +497,7 @@ int main(int argc, char **argv)
     }
 
     printf("Exiting.\n");
-    XDestroyWindow(dpy, win);
-    XCloseDisplay(dpy);
+    XDestroyWindow(display, window);
+    XCloseDisplay(display);
     return 0;
 }

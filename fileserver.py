@@ -48,10 +48,13 @@ class Handler(BaseHTTPRequestHandler):
             if data.endswith(b"\r\n"):
                 data = data[:-2]
             filename = None
-            for tok in hdr.decode(errors="replace").split(";"):
-                tok = tok.strip()
-                if tok.startswith("filename="):
-                    filename = os.path.basename(tok[9:].strip('"'))
+            for line in hdr.decode(errors="replace").splitlines():
+                if not line.lower().startswith("content-disposition"):
+                    continue
+                for tok in line.split(";"):
+                    tok = tok.strip()
+                    if tok.startswith("filename="):
+                        filename = os.path.basename(tok[9:].strip('"'))
             if not filename or not data:
                 continue
             with open(os.path.join(DIR, filename), "wb") as f:
